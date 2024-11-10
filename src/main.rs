@@ -9,9 +9,7 @@ use reqwest::{Client, Error};
 use secp256k1::{ecdsa::RecoveryId, All, Message, PublicKey, Secp256k1, SecretKey};
 use serde_json::json;
 use sha3::{Digest, Keccak256};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-const GENESIS_TIMESTAMP: u64 = 1606824023; // Genesis time (Dec 1, 2020, 12:00:23 PM UTC)
 const SLOT_DURATION: u64 = 12;
 
 #[tokio::main]
@@ -29,13 +27,7 @@ async fn main() -> anyhow::Result<()> {
     // Seems to decode properly
     // raw_decode(raw.clone());
 
-    let current_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let slot_time = current_time + 3;
-    let slot = (slot_time - GENESIS_TIMESTAMP) / SLOT_DURATION;
-
+    let slot = calculate_slot(3).await?;
     let digest = message_digest(tx, slot);
     let header = create_header(&secret_key, &public_key, &secp, &digest);
 
@@ -49,6 +41,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn calculate_slot(seconds_from_now: u64) -> anyhow::Result<u64> {
+    let response = reqwest::get("http://127.0.0.1:32779/eth/v1/beacon/headers/head")
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+
+    dbg!(&response["data"]["header"]["message"]["slot"]);
+    let current_slot: u64 = response["data"]["header"]["message"]["slot"]
+        .as_str()
+        .expect("Invalid slot data")
+        .parse()?;
+
+    dbg!(current_slot);
+    let slots_ahead = seconds_from_now / SLOT_DURATION;
+    dbg!(slots_ahead);
+    let future_slot = current_slot + slots_ahead;
+    dbg!(future_slot);
+
+    Ok(future_slot)
 }
 
 fn raw_decode(raw: String) {
@@ -67,10 +80,7 @@ async fn send_request(
     let request_body = json!({
         "jsonrpc": "2.0",
         "method": "bolt_requestInclusion",
-        "params":  vec![json!({
-            "txs": vec![data.0],
-            "slot": data.1
-        })],
+        "params":  [{ "txs": [data.0], "slot": data.1 }],
         "id": 1,
     });
 
