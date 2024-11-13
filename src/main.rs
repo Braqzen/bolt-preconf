@@ -10,12 +10,12 @@ use secp256k1::{ecdsa::RecoveryId, All, Message, PublicKey, Secp256k1, SecretKey
 use serde_json::json;
 use sha3::{Digest, Keccak256};
 
-const SLOT_DURATION: u64 = 12;
+const SLOT_DURATION: u64 = 2;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // TODO: lazy, just put the port in manually after you start the devnet
-    let port = 32791;
+    let port = 32871;
     let client = Client::new();
 
     let secp = Secp256k1::new();
@@ -24,10 +24,12 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, raw) = create_tx(secret_key);
 
+    dbg!(&raw);
+
     // Seems to decode properly
     // raw_decode(raw.clone());
 
-    let slot = calculate_slot(3).await?;
+    let slot = calculate_slot(SLOT_DURATION * 16).await?;
     let digest = message_digest(tx, slot);
     let header = create_header(&secret_key, &public_key, &secp, &digest);
 
@@ -44,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn calculate_slot(seconds_from_now: u64) -> anyhow::Result<u64> {
-    let response = reqwest::get("http://127.0.0.1:32779/eth/v1/beacon/headers/head")
+    let response = reqwest::get("http://127.0.0.1:32859/eth/v1/beacon/headers/head")
         .await?
         .json::<serde_json::Value>()
         .await?;
@@ -99,13 +101,13 @@ fn create_tx(secret_key: SecretKey) -> (TxEnvelope, String) {
     let mut rng = rand::thread_rng();
 
     let tx = TxEip1559 {
-        chain_id: 1,
+        chain_id: 3151908,
         nonce: rng.gen_range(1..=u64::MAX),
         gas_limit: rng.gen_range(21000..=100000),
         to: TxKind::Call(address!("6069a6c32cf691f5982febae4faf8a6f3ab2f0f6")),
-        value: U256::from(rng.gen_range(1..=100000)),
-        max_fee_per_gas: rng.gen_range(1..=100000),
-        max_priority_fee_per_gas: rng.gen_range(1..=100000),
+        value: U256::from(rng.gen_range(1..=10)),
+        max_fee_per_gas: rng.gen_range(20..=100),
+        max_priority_fee_per_gas: rng.gen_range(1..=2),
         ..Default::default()
     };
 
@@ -125,7 +127,7 @@ fn create_tx(secret_key: SecretKey) -> (TxEnvelope, String) {
         _ => panic!("Unsupported recovery ID"),
     };
 
-    let signature = PrimitiveSignature::new(r, s, v);
+    let signature = PrimitiveSignature::new(r, s, true);
 
     let signed_tx = tx.into_signed(signature);
     let envelope = TxEnvelope::Eip1559(signed_tx);
