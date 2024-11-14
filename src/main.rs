@@ -1,39 +1,46 @@
+use std::str::FromStr;
+
 use alloy::{
     consensus::{SignableTransaction, TxEip1559, TxEnvelope},
     eips::eip2718::{Decodable2718, Encodable2718},
-    primitives::{address, hex, keccak256, PrimitiveSignature, TxKind, U256},
+    primitives::{address, hex, keccak256, FixedBytes, TxKind, U256},
     rlp::{BytesMut, Decodable, Encodable},
+    signers::{local::PrivateKeySigner, Signer},
 };
 use rand::Rng;
 use reqwest::{Client, Error};
-use secp256k1::{ecdsa::RecoveryId, All, Message, PublicKey, Secp256k1, SecretKey};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
 
-const SLOT_DURATION: u64 = 2;
+const SLOT_DURATION: u64 = 12;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // TODO: lazy, just put the port in manually after you start the devnet
-    let port = 32871;
+    // bolt-sidecar-1-lighthouse-geth
+    let sidecar_port = 32898;
+    // el-1-geth-lighthouse
+    let el_rpc = "http://127.0.0.1:32876";
+
     let client = Client::new();
+    let signer = PrivateKeySigner::from_str(
+        "bcdf20249abf0ed6d944c0288fad489e33f66b3960d9e6229c1cd214ed3bbe31",
+    )?;
 
-    let secp = Secp256k1::new();
-    let secret_key = SecretKey::from_byte_array(&[0xcd; 32]).expect("32 bytes, within curve order");
-    let public_key = PublicKey::from_secret_key(&secp, &secret_key).serialize_uncompressed();
+    let balance = get_balance(el_rpc, &*signer.address().to_string()).await?;
+    dbg!(balance);
 
-    let (tx, raw) = create_tx(secret_key);
-
+    let (tx, raw) = create_tx(&signer, &client, el_rpc).await?;
     dbg!(&raw);
 
-    // Seems to decode properly
-    // raw_decode(raw.clone());
+    // // Seems to decode properly
+    // // raw_decode(raw.clone());
 
-    let slot = calculate_slot(SLOT_DURATION * 16).await?;
+    let slot = calculate_slot(SLOT_DURATION * 5).await?;
     let digest = message_digest(tx, slot);
-    let header = create_header(&secret_key, &public_key, &secp, &digest);
+    let header = create_header(&signer, &digest).await?;
+    dbg!(&header);
 
-    match send_request(port, &client, (raw, slot, header)).await {
+    match send_request(sidecar_port, &client, (raw, slot, header)).await {
         Ok(response) => {
             println!("Response: {:?}", response);
         }
@@ -45,13 +52,82 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn get_balance(rpc_url: &str, address: &str) -> anyhow::Result<u128> {
+    let client = Client::new();
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_getBalance",
+        "params": [address, "latest"],
+        "id": 1
+    });
+
+    let response: Value = client
+        .post(rpc_url)
+        .json(&request)
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    // Parse the balance (which is returned as a hex string)
+    if let Some(balance_str) = response.get("result").and_then(|r| r.as_str()) {
+        let balance = u128::from_str_radix(balance_str.trim_start_matches("0x"), 16)?;
+        Ok(balance)
+    } else {
+        Err(anyhow::anyhow!("No balance found"))
+    }
+}
+
+async fn create_tx(
+    signer: &PrivateKeySigner,
+    client: &Client,
+    el_rpc: &str,
+) -> anyhow::Result<(TxEnvelope, String)> {
+    let mut rng = rand::thread_rng();
+
+    let nonce = query(
+        &client,
+        el_rpc,
+        "eth_getTransactionCount",
+        vec![format!("{:?}", signer.address()), "finalized".to_string()],
+    )
+    .await?;
+    dbg!(nonce);
+    let min_priority_fee = query(&client, el_rpc, "eth_maxPriorityFeePerGas", vec![]).await?;
+    let max_priority_fee_per_gas = min_priority_fee;
+    let max_fee_per_gas = max_priority_fee_per_gas + 66_371;
+
+    let tx = TxEip1559 {
+        chain_id: 3151908,
+        nonce: nonce as u64,
+        gas_limit: rng.gen_range(21000..=100000),
+        to: TxKind::Call(address!("E25583099BA105D9ec0A67f5Ae86D90e50036425")),
+        value: U256::from(rng.gen_range(0.0001..=0.0002)),
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        ..Default::default()
+    };
+
+    let mut buff = BytesMut::new();
+    tx.encode(&mut buff);
+    let tx_hash = keccak256(&buff);
+
+    let signature = signer.sign_message(tx_hash.as_ref()).await?;
+
+    let signed_tx = tx.into_signed(signature);
+    let envelope = TxEnvelope::Eip1559(signed_tx);
+    let raw = hex::encode_prefixed(envelope.encoded_2718());
+
+    Ok((envelope, raw))
+}
+
 async fn calculate_slot(seconds_from_now: u64) -> anyhow::Result<u64> {
-    let response = reqwest::get("http://127.0.0.1:32859/eth/v1/beacon/headers/head")
+    let response = reqwest::get("http://127.0.0.1:32886/eth/v1/beacon/headers/head")
         .await?
         .json::<serde_json::Value>()
         .await?;
 
-    dbg!(&response["data"]["header"]["message"]["slot"]);
     let current_slot: u64 = response["data"]["header"]["message"]["slot"]
         .as_str()
         .expect("Invalid slot data")
@@ -66,16 +142,29 @@ async fn calculate_slot(seconds_from_now: u64) -> anyhow::Result<u64> {
     Ok(future_slot)
 }
 
-fn raw_decode(raw: String) {
-    let tx = raw.trim_start_matches("0x");
-    let tx_bytes = hex::decode(tx).expect("Failed bytes");
+fn message_digest(tx: TxEnvelope, target_slot: u64) -> FixedBytes<32> {
+    let mut data = Vec::new();
 
-    let envelope = TxEnvelope::decode_2718(&mut &tx_bytes[..]).expect("Failed 2718");
-    dbg!(envelope);
+    data.extend_from_slice(tx.tx_hash().as_slice());
+    data.extend_from_slice(&target_slot.to_le_bytes());
+    let hash = Keccak256::digest(data);
+
+    FixedBytes::new(hash.into())
+}
+
+async fn create_header(
+    signer: &PrivateKeySigner,
+    digest: &FixedBytes<32>,
+) -> anyhow::Result<String> {
+    let address = signer.address();
+    let signature = signer.sign_hash(digest).await?;
+    let encoded_signature = hex::encode(signature.as_bytes());
+
+    Ok(format!("{address}:0x{encoded_signature}"))
 }
 
 async fn send_request(
-    port: u64,
+    sidecar_port: u64,
     client: &Client,
     data: (String, u64, String),
 ) -> Result<serde_json::Value, Error> {
@@ -87,7 +176,7 @@ async fn send_request(
     });
 
     let response = client
-        .post(format!("http://127.0.0.1:{}", port))
+        .post(format!("http://127.0.0.1:{}", sidecar_port))
         .header("X-Bolt-Signature", data.2)
         .json(&request_body)
         .send()
@@ -97,81 +186,45 @@ async fn send_request(
     Ok(json_response)
 }
 
-fn create_tx(secret_key: SecretKey) -> (TxEnvelope, String) {
-    let mut rng = rand::thread_rng();
+fn raw_decode(raw: String) {
+    let tx = raw.trim_start_matches("0x");
+    let tx_bytes = hex::decode(tx).expect("Failed bytes");
 
-    let tx = TxEip1559 {
-        chain_id: 3151908,
-        nonce: rng.gen_range(1..=u64::MAX),
-        gas_limit: rng.gen_range(21000..=100000),
-        to: TxKind::Call(address!("6069a6c32cf691f5982febae4faf8a6f3ab2f0f6")),
-        value: U256::from(rng.gen_range(1..=10)),
-        max_fee_per_gas: rng.gen_range(20..=100),
-        max_priority_fee_per_gas: rng.gen_range(1..=2),
-        ..Default::default()
-    };
-
-    let secp = Secp256k1::new();
-    let mut buff = BytesMut::new();
-    tx.encode(&mut buff);
-    let tx_hash = keccak256(&buff);
-    let message = Message::from_digest(tx_hash.0);
-    let signature = secp.sign_ecdsa_recoverable(&message, &secret_key);
-    let (recovery_id, sig) = signature.serialize_compact();
-    let (r, s) = sig.split_at(32);
-    let r = U256::from_be_slice(r);
-    let s = U256::from_be_slice(s);
-    let v = match recovery_id {
-        RecoveryId::Zero => true,
-        RecoveryId::One => false,
-        _ => panic!("Unsupported recovery ID"),
-    };
-
-    let signature = PrimitiveSignature::new(r, s, true);
-
-    let signed_tx = tx.into_signed(signature);
-    let envelope = TxEnvelope::Eip1559(signed_tx);
-    let raw = hex::encode_prefixed(envelope.encoded_2718());
-
-    (envelope, raw)
+    let envelope = TxEnvelope::decode_2718(&mut &tx_bytes[..]).expect("Failed 2718");
+    dbg!(envelope);
 }
 
-fn message_digest(tx: TxEnvelope, target_slot: u64) -> Message {
-    let message_digest = {
-        let mut data = Vec::new();
+async fn query(
+    client: &Client,
+    rpc_url: &str,
+    method: &str,
+    params: Vec<String>,
+) -> anyhow::Result<u128> {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+        "id": 1
+    });
 
-        data.extend_from_slice(tx.tx_hash().as_slice());
-        data.extend_from_slice(&target_slot.to_le_bytes());
+    let response: Value = client
+        .post(rpc_url)
+        .json(&request)
+        .send()
+        .await?
+        .json()
+        .await?;
 
-        Keccak256::digest(data)
-    };
-
-    Message::from_digest(message_digest.into())
-}
-
-fn create_header(
-    secret_key: &SecretKey,
-    public_key: &[u8; 65],
-    secp: &Secp256k1<All>,
-    digest: &Message,
-) -> String {
-    let public_key = &public_key[1..];
-
-    let mut hasher = Keccak256::new();
-    hasher.update(public_key);
-    let hash = hasher.finalize();
-
-    let address: [u8; 20] = hash[12..].try_into().expect("Failed to get address");
-    let address = hex::encode(address);
-
-    let signature = secp.sign_ecdsa_recoverable(digest, &secret_key);
-    let (recovery_id, signature) = signature.serialize_compact();
-
-    let mut signature_bytes = Vec::with_capacity(65);
-    signature_bytes.extend_from_slice(&signature);
-    signature_bytes.push(recovery_id as u8);
-
-    let signature = hex::encode(signature_bytes);
-
-    format!("0x{address}:0x{signature}")
+    if let Some(result) = response.get("result") {
+        if let Some(result_str) = result.as_str() {
+            match u128::from_str_radix(result_str.trim_start_matches("0x"), 16) {
+                Ok(value) => Ok(value),
+                Err(e) => Err(anyhow::anyhow!("Failed to parse nonce value: {}", e)),
+            }
+        } else {
+            Err(anyhow::anyhow!("Result is not a valid string"))
+        }
+    } else {
+        Err(anyhow::anyhow!("No 'result' field found in the response"))
+    }
 }
